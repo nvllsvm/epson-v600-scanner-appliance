@@ -1,0 +1,374 @@
+#!/usr/bin/python3
+import argparse
+import asyncio
+import functools
+import contextlib
+import concurrent.futures
+import datetime
+import enum
+import io
+import os
+import pathlib
+import shutil
+import sys
+import time
+import tempfile
+
+os.environ['VIPS_PIPE_READ_LIMIT'] = '-1'
+
+import pyvips
+
+
+DEVICE_NAME = 'EpsonPerfectionV600'
+
+# output from 'gamma4scanimage 1.0 0 255 255 255'
+# the epson v600 only supports 0-255 in it's gamma table
+GAMMA_1_0_TABLE = '[0]0-[1]1-[1]1-[2]2-[3]3-[5]5-[7]7-[11]11-[17]17-[25]25-[38]38-[57]57-[86]86-[129]129-[194]194-[255]255-[255]255'
+
+ICC_DIR = pathlib.Path('/etc/webapps/scanservjs/icc')
+COLOR_CORRECTION_PROFILES = {
+        'Flatbed': ICC_DIR / 'SFprofR (Perfection V600).icc',
+        'Transparency Unit': ICC_DIR / 'SFprofT (Perfection V600).icc',
+}
+
+COLOR_SPACE_PROFILES = {
+        'Adobe RGB (1998)': ICC_DIR / 'AdobeRGB1998.icc',
+        'EPSON sRGB': ICC_DIR / 'ewsrgb.icm',
+        'sRGB IEC61966-2.1': ICC_DIR / 'sRGB Color Space Profile.icm',
+}
+
+DEFAULT_JPEG_QUALITY = 92
+PREVIEW_JPEG_QUALITY = 75
+
+MAX_MEM_WRITE = 10 * 1024 * 1024 * 1024
+
+RESOLUTIONS = [
+    200,
+    400,
+    800,
+    1600,
+    3200,
+    6400,
+]
+
+# flatbed
+SCAN_AREA_LIMITS = {
+    'Flatbed': {
+        'x': {'min': 0.0, 'max': 215.9},
+        'y': {'min': 0.0, 'max': 297.18},
+    },
+    'Transparency Unit': {
+        'x': {'min': 0.0, 'max': 68.58},
+        'y': {'min': 0.0, 'max': 241.316},
+    }
+}
+
+PREVIEW_JPG = 1200
+
+PREVIEW_HEIGHT = 1195
+PREVIEW_WIDTH = 868
+
+THUMBNAIL_SIZE = 128
+
+PREVIEW_MM_TO_PX = PREVIEW_WIDTH / SCAN_AREA_LIMITS['Flatbed']['x']['max']
+
+STORAGE_PATH = pathlib.Path('/var/lib/webapps/scanservjs')
+IMAGE_PATH = STORAGE_PATH / 'output'
+THUMBNAIL_PATH = STORAGE_PATH / 'thumbnail'
+PREVIEW_PATH = STORAGE_PATH / 'preview' / 'preview.jpg'
+TEMP_RAM_PATH = STORAGE_PATH / 'temp'
+TEMP_DISK_PATH = STORAGE_PATH / 'temp_disk'
+
+class TIFFTag(enum.IntEnum):
+    IMAGE_DESCRIPTION = 270
+    MAKE = 271
+    MODEL = 272
+    SOFTWARE = 305
+    DATE_TIME = 306
+    X_RESOLUTION = 282
+    Y_RESOLUTION = 283
+    RESOLUTION_UNIT = 296
+
+
+@contextlib.contextmanager
+def TempPath(**kwargs):
+    """Wrapper around tempfile.NamedTemporaryFile which returns a path object
+
+    Unlike tempfile.NamedTemporaryFile, the FileNotFoundError exception is not
+    raised if the file is deleted before the context closes.
+
+    :rtype: pathlib.Path
+    """
+    with tempfile.NamedTemporaryFile(**kwargs, delete=False) as tmp:
+        temp_path = pathlib.Path(tmp.name)
+        try:
+            yield temp_path
+        finally:
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+@contextlib.asynccontextmanager
+async def scanimage(*args):
+    read, write = os.pipe()
+    proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=write)
+    os.close(write)
+    yield read
+    await proc.wait()
+    if proc.returncode != 0:
+        raise ProcessError(proc)
+
+
+class ProcessError(Exception):
+    def __init__(self, process, message=None):
+        self.process = process
+        self.message = message
+
+    def __str__(self):
+        proc = self.process
+
+        text = f'exit {proc.returncode}'
+        if self.message is not None:
+            text = f'{text} - {self.message}'
+
+        try:
+            args = proc._transport._extra['subprocess'].args
+        except (AttributeError, KeyError):
+            pass
+        else:
+            text = f'{text}: {args}'
+        return text
+
+
+def build_args(parser_args):
+    resolution = parser_args.resolution
+
+    # slighty faster than using --preview and/or --preview-speed=yes
+    if parser_args.preview:
+        resolution = 200
+
+    return [
+            'scanimage',
+            '--device-name', DEVICE_NAME,
+            '--source', parser_args.source,
+            '--mode', parser_args.mode,
+            '--resolution', str(parser_args.resolution),
+            '-l', str(parser_args.l),
+            '-t', str(parser_args.t),
+            '-x', str(parser_args.x),
+            '-y', str(parser_args.y),
+
+            # always scan in ppm as libvips's can read it natively.
+            # scanning in tiff will cause libvips to fail when reading
+            # large images from a descriptor.
+            '--format', 'pnm',
+
+            # always scan at 16bit for more accurate post-processing
+            '--depth', '16',
+
+            # always use linear gamma
+            '--gamma-correction', 'User defined (Gamma=1.0)',
+
+            # force a linear gamma table for each channel
+            '--red-gamma-table', GAMMA_1_0_TABLE,
+            '--green-gamma-table', GAMMA_1_0_TABLE,
+            '--blue-gamma-table', GAMMA_1_0_TABLE,
+    ]
+
+
+IMAGE_SUFFIXES = {
+        'jpeg': '.jpg',
+        'png': '.png',
+        'tiff': '.tif',
+        'ppm': '.ppm'
+}
+
+
+def apply_image_options(image, args):
+    if args.gamma_correction != 1.0:
+        image = image.gamma(exponent=args.gamma_correction)
+    if args.color_space and args.color_space != 'None':
+        out_profile = COLOR_SPACE_PROFILES[args.color_space]
+        in_profile = None
+        if args.color_correction == 'yes':
+            in_profile = COLOR_CORRECTION_PROFILES[args.source]
+        image = image.icc_transform(
+                out_profile,
+                input_profile=in_profile,
+                depth=args.depth)
+    if args.depth == 8:
+        image = image.colourspace('srgb')
+    return image
+
+
+async def async_main(args):
+    now = datetime.datetime.now(datetime.UTC)
+
+    bargs = build_args(args)
+    dpi = args.resolution
+    depth = args.depth
+
+    # ignore the specified output and set the name here
+    name = now.strftime('scan_%Y%m%d_%H%M%S') + IMAGE_SUFFIXES[args.format]
+    image_path = IMAGE_PATH / name
+    thumbnail_path = THUMBNAIL_PATH / name
+    preview_path = PREVIEW_PATH
+
+    args.output = image_path
+
+    async with scanimage(*bargs) as read_scan:
+        source = pyvips.Source.new_from_descriptor(read_scan)
+        image = pyvips.Image.new_from_source(source, '', access='sequential')
+
+        image = apply_image_options(image, args)
+        image = image.copy_memory()
+
+        with contextlib.ExitStack() as stack:
+            preview_tmp = stack.enter_context(TempPath(dir=TEMP_RAM_PATH))
+            if args.output:
+                image_tmp = stack.enter_context(TempPath(dir=TEMP_DISK_PATH))
+                thumbnail_tmp = stack.enter_context(TempPath(dir=TEMP_DISK_PATH))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = []
+                if args.output:
+                    futures.append(executor.submit(build_output_call(
+                        image.copy(),
+                        image_tmp, args)))
+                    futures.append(executor.submit(build_thumbnail_call(
+                        image.copy(),
+                        thumbnail_tmp, args)))
+                futures.append(executor.submit(build_preview_call(
+                    image.copy(),
+                    preview_tmp, args)))
+                for future in concurrent.futures.as_completed(futures):
+                    future.result()
+
+            preview_tmp.rename(preview_path)
+            thumbnail_tmp.rename(thumbnail_path)
+            image_tmp.rename(image_path)
+            (TEMP_RAM_PATH / image_path.name).touch()
+
+
+def build_output_call(image, path, args):
+    match args.format:
+        case 'tiff':
+            return functools.partial(image.tiffsave, path)
+        case 'jpeg':
+            return functools.partial(image.jpegsave, path, Q=92)
+        case 'png':
+            return functools.partial(image.pngsave, path, compression=0, bitdepth=args.depth)
+
+
+def build_thumbnail_call(image, path, args):
+    image = image.thumbnail_image(THUMBNAIL_SIZE)
+    return functools.partial(image.jpegsave, path, Q=75)
+
+
+def build_preview_call(image, path, args):
+    limits = SCAN_AREA_LIMITS[args.source]
+    is_fullsize = all((
+            args.l == limits['x']['min'],
+            args.t == limits['y']['min'],
+            args.x == limits['x']['max'],
+            args.y == limits['y']['max']))
+    if is_fullsize:
+        width = PREVIEW_WIDTH
+        height = PREVIEW_HEIGHT
+    else:
+        width = round(args.x * PREVIEW_MM_TO_PX)
+        height = round(args.y * PREVIEW_MM_TO_PX)
+        top_x = round(args.l * PREVIEW_MM_TO_PX)
+        top_y = round(args.t * PREVIEW_MM_TO_PX)
+
+    image = image.thumbnail_image(width, height=height)
+    if not is_fullsize:
+        image = image.embed(top_x, top_y, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+    return functools.partial(image.jpegsave, path, Q=75)
+
+
+def validate_scan_area(args):
+    limits = SCAN_AREA_LIMITS[args.source]
+    if args.l is None:
+        args.l = limits['x']['min']
+    if args.t is None:
+        args.t = limits['y']['min']
+    if args.x is None:
+        args.x = limits['x']['max']
+    if args.y is None:
+        args.y = limits['y']['max']
+    for dimen in ('x', 'y'):
+        value = getattr(args, dimen)
+        limits = SCAN_AREA_LIMITS[args.source][dimen]
+        if value < limits['min'] or value > limits['max']:
+            raise argparse.ArgumentError()
+        
+    # TODO: fix UI imprecision
+    if args.source == 'Flatbed' and args.y >= 297.1:
+        args.y = SCAN_AREA_LIMITS[args.source]['y']['max']
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+            '--gamma-correction',
+            type=float,
+            choices=[1.0, 1.8, 2.0, 2.2, 2.4, 2.8],
+            default=1.0)
+    parser.add_argument(
+            '--color-correction',
+            choices=['yes', 'no'],
+            default=['no'])
+    parser.add_argument(
+            '--color-space',
+            choices=['None', *COLOR_SPACE_PROFILES],
+            default='None')
+    parser.add_argument(
+            '--format',
+            choices=['tiff', 'png', 'jpeg'],
+            default='tiff')
+    parser.add_argument(
+            '--source',
+            choices=['Flatbed', 'Transparency Unit'],
+            default='Flatbed',
+    )
+    parser.add_argument(
+            '--mode',
+            choices=['Binary', 'Gray', 'Color'],
+            default='Color',
+    )
+    parser.add_argument(
+            '--depth',
+            type=int,
+            choices=[8, 16],
+            default=8,
+    )
+    parser.add_argument('-l', type=float)
+    parser.add_argument('-x', type=float)
+    parser.add_argument('-t', type=float)
+    parser.add_argument('-y', type=float)
+    parser.add_argument(
+            '--resolution',
+            choices=RESOLUTIONS,
+            type=int,
+            default=200,
+    )
+
+    scan_type_group = parser.add_mutually_exclusive_group(required=True)
+    scan_type_group.add_argument(
+            '-o', '--output', type=pathlib.Path)
+    scan_type_group.add_argument(
+            '--preview', action='store_true')
+    args, unknown_args = parser.parse_known_args()
+
+    parser.add_argument('--postprocess', action='store_true')
+
+    validate_scan_area(args)
+    asyncio.run(async_main(args))
+
+
+if __name__ == '__main__':
+    main()
